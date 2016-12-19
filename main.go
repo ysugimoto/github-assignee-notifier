@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 
 	"bytes"
+	"flag"
 	"fmt"
 	"os"
 	"time"
@@ -54,19 +55,39 @@ func (l Logger) Write(message string) {
 	fmt.Println(message)
 }
 func (l Logger) Passive(message string) {
-	fmt.Println(DARK, message, RESET)
+	if *isNocolor {
+		fmt.Println(message)
+	} else {
+		fmt.Println(DARK, message, RESET)
+	}
 }
 func (l Logger) Error(message string) {
-	fmt.Println(RED, message, RESET)
+	if *isNocolor {
+		fmt.Println(message)
+	} else {
+		fmt.Println(DARK, message, RESET)
+	}
 }
 func (l Logger) Warn(message string) {
-	fmt.Println(YELLOW, message, RESET)
+	if *isNocolor {
+		fmt.Println(message)
+	} else {
+		fmt.Println(YELLOW, message, RESET)
+	}
 }
 func (l Logger) Notify(message string) {
-	fmt.Println(BLUE, message, RESET)
+	if *isNocolor {
+		fmt.Println(message)
+	} else {
+		fmt.Println(BLUE, message, RESET)
+	}
 }
 func (l Logger) Success(message string) {
-	fmt.Println(GREEN, message, RESET)
+	if *isNocolor {
+		fmt.Println(message)
+	} else {
+		fmt.Println(GREEN, message, RESET)
+	}
 }
 
 const GITHUB_APIBASE = "https://api.github.com"
@@ -77,6 +98,10 @@ var db *leveldb.DB
 var config *Config
 var baseDir string
 var logger Logger
+
+var isNocolor *bool
+var isJson *bool
+var isSilent *bool
 
 func init() {
 	var err error
@@ -196,6 +221,10 @@ func initializeSettings() *Config {
 }
 
 func main() {
+	isNocolor = flag.Bool("nocolor", false, "No colored output")
+	isJson = flag.Bool("json", false, "Message returns JSON string")
+	isSilent = flag.Bool("silent", false, "Silent mode: stop notification, output only")
+
 	defer db.Close()
 
 	wait := make(chan struct{}, 0)
@@ -268,18 +297,30 @@ func watchPullRequests(repo string) {
 		key := []byte(fmt.Sprint(pr.Id))
 		if v, err := db.Get(key, nil); err != nil {
 			// Didn't notify?
-			logger.Notify(fmt.Sprintf("Assigned PR found: #%d %s %s", pr.Number, pr.Title, pr.Url))
+			if !*isJson {
+				logger.Notify(fmt.Sprintf("Assigned PR found: #%d %s %s", pr.Number, pr.Title, pr.Url))
+				// send notification in goroutine
+				go notify(pr)
+			} else {
+				buf, _ := json.Marshal(pr)
+				logger.Notify(string(buf))
+			}
 		} else if isReNotify(v) {
 			// Need to notify repeatable?
-			logger.Warn(fmt.Sprintf("[REPEAT] Assigned PR found: #%d %s %s", pr.Number, pr.Title, pr.Url))
+			if !*isJson {
+				logger.Warn(fmt.Sprintf("[REPEAT] Assigned PR found: #%d %s %s", pr.Number, pr.Title, pr.Url))
+				// send notification in goroutine
+				go notify(pr)
+			} else {
+				buf, _ := json.Marshal(pr)
+				logger.Notify(string(buf))
+			}
 		} else {
 			continue
 		}
-		if err := notify(pr); err != nil {
-			continue
-		}
+
 		// Save last notified timestamp
-		val := []byte{}
+		val := make([]byte, 8)
 		binary.LittleEndian.PutUint64(val, uint64(time.Now().Unix()))
 		db.Put(key, val, nil)
 	}
@@ -290,7 +331,7 @@ func isReNotify(v []byte) (is bool) {
 	now := uint64(time.Now().Unix())
 	last := binary.LittleEndian.Uint64(v)
 
-	if last+config.Repeat > now {
+	if last+config.Repeat < now {
 		is = true
 	}
 
@@ -299,6 +340,9 @@ func isReNotify(v []byte) (is bool) {
 
 // Send notification
 func notify(pr PullRequest) error {
+	if *isSilent {
+		return nil
+	}
 	args := []string{
 		"-title",
 		fmt.Sprintf("New Pull Request Assigned: #%d", pr.Number),

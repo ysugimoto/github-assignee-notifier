@@ -26,12 +26,13 @@ $ github-assignee-notifiler init
 
 And created config at `$HOME/.github_assinee_notifiler/config`.
 
-|      key         |  type      |          value             |
-|:------------:    |:------:    |:----------------------:    |
-| name             | string     | Your github name           |
-| token            | string     | github access token        |
-| polling          | int        | polling duration (sec)     |
-| repositories     | array      | repositories to watch      |
+|      key         |  type      |          value                |
+|:------------:    |:------:    |:----------------------:       |
+| name             | string     | Your github name              |
+| token            | string     | github access token           |
+| polling          | int        | polling duration (sec)        |
+| repeat           | uint       | repease notify duration (sec) |
+| repositories     | array      | repositories to watch         |
 
 After, you can watch the PRs simply:
 
