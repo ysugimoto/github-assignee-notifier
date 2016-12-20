@@ -1,6 +1,6 @@
 ## github-assignee-notifier
 
-Notify message when you has been assigned pull reqeusts.
+Notify message when you have been assigned pull reqeusts.
 
 ### macOS / OS X
 
