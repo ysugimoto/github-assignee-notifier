@@ -1,6 +1,6 @@
 ## github-assignee-notifier
 
-Notify message when you have been assigned pull reqeusts.
+Notify message when you have been assigned pull requests.
 
 ### macOS / OS X
 
@@ -18,13 +18,13 @@ Still a work in progress...
 
 Download binary from [release page](https://github.com/ysugimoto/github-assignee-notifier/releases) on your architecture, and set the executable path.
 
-`github-assignee-notifiler` uses some settigns. So you can initialize this command:
+`github-assignee-notifiler` uses some settings. So you can initialize this command:
 
 ```
 $ github-assignee-notifiler init
 ```
 
-And created config at `$HOME/.github_assinee_notifiler/config`, open your editor and put these section values:
+And created config at `$HOME/.github_assinee_notifiler/config`, open your editor and put these section value(s):
 
 |      key         |  type      |          value                |
 |:------------:    |:------:    |:----------------------:       |
