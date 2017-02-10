@@ -55,39 +55,19 @@ func (l Logger) Write(message string) {
 	fmt.Println(message)
 }
 func (l Logger) Passive(message string) {
-	if *isNocolor {
-		fmt.Println(message)
-	} else {
-		fmt.Println(DARK, message, RESET)
-	}
+	fmt.Println(DARK, message, RESET)
 }
 func (l Logger) Error(message string) {
-	if *isNocolor {
-		fmt.Println(message)
-	} else {
-		fmt.Println(DARK, message, RESET)
-	}
+	fmt.Println(DARK, message, RESET)
 }
 func (l Logger) Warn(message string) {
-	if *isNocolor {
-		fmt.Println(message)
-	} else {
-		fmt.Println(YELLOW, message, RESET)
-	}
+	fmt.Println(YELLOW, message, RESET)
 }
 func (l Logger) Notify(message string) {
-	if *isNocolor {
-		fmt.Println(message)
-	} else {
-		fmt.Println(BLUE, message, RESET)
-	}
+	fmt.Println(BLUE, message, RESET)
 }
 func (l Logger) Success(message string) {
-	if *isNocolor {
-		fmt.Println(message)
-	} else {
-		fmt.Println(GREEN, message, RESET)
-	}
+	fmt.Println(GREEN, message, RESET)
 }
 
 const GITHUB_APIBASE = "https://api.github.com"
