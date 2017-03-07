@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os/exec"
 	"path/filepath"
 
@@ -17,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -36,6 +38,19 @@ type PullRequest struct {
 	Assignee map[string]interface{} `json:"assignee"`
 	Number   int                    `json:"number"`
 	Url      string                 `json:"html_url"`
+}
+
+// Comment data
+type Comment struct {
+	Id   int    `json:"id"`
+	Body string `json:"body"`
+	Url  string `json:"html_url"`
+}
+
+// Reviewer data
+type Reviewer struct {
+	Id   int    `json:"id"`
+	Name string `json:"login"`
 }
 
 // Ansi colors
@@ -92,13 +107,15 @@ func init() {
 
 	// Initialize only
 	// e.g. [command] init
-	if len(os.Args) > 1 && os.Args[1] == "init" {
-		if _, err := os.Stat(baseDir); err == nil {
-			logger.Success(fmt.Sprintf("Settings already initialized. If you want to change at %s files and edit them.", baseDir))
+	if len(os.Args) > 1 {
+		if os.Args[1] == "init" {
+			if _, err := os.Stat(baseDir); err == nil {
+				logger.Success(fmt.Sprintf("Settings already initialized. If you want to change at %s files and edit them.", baseDir))
+				os.Exit(0)
+			}
+			initializeSettings()
 			os.Exit(0)
 		}
-		initializeSettings()
-		os.Exit(0)
 	}
 
 	// Check settings directory or create it
@@ -137,10 +154,10 @@ func init() {
 		ok = false
 	}
 
-	// Calculate watch repositories mey over the API limit rate
+	// Calculate watch repositories to avoid over the API limit rate
 	if (3600/config.PollingTime)*len(config.Repositories) > GITHUB_API_LIMIT {
 		logger.Warn(
-			fmt.Sprintf("Number of %d repositories, and polling by %s sec may be over the Github API LIMIT.", len(config.Repositories), config.PollingTime),
+			fmt.Sprintf("Number of %d repositories, and polling by %d sec may be over the Github API LIMIT.", len(config.Repositories), config.PollingTime),
 		)
 	}
 
@@ -207,6 +224,15 @@ func main() {
 
 	defer db.Close()
 
+	if len(os.Args) > 1 && os.Args[1] == "summary" {
+		from := "yesterday"
+		if len(os.Args) > 2 {
+			from = os.Args[2]
+		}
+		showSummary(from)
+		return
+	}
+
 	wait := make(chan struct{}, 0)
 
 	for i, r := range config.Repositories {
@@ -228,18 +254,18 @@ func main() {
 	<-wait
 }
 
-// Send API reqeust and check assigned you
-// @param repo string
-func watchPullRequests(repo string) {
-	logger.Passive("Watch pull requests: " + repo)
-
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/repos/%s/pulls", GITHUB_APIBASE, repo), nil)
+func sendRequest(url string, customHeaders map[string]string) ([]byte, error) {
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		logger.Error("[ERROR] " + err.Error())
-		return
+		return nil, err
 	}
 	// Attach access token
 	req.Header.Add("Authorization", "token "+config.AccessToken)
+	if customHeaders != nil {
+		for key, val := range customHeaders {
+			req.Header.Add(key, val)
+		}
+	}
 	client := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
@@ -249,15 +275,28 @@ func watchPullRequests(repo string) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		logger.Error("[ERROR] " + err.Error())
-		return
-	}
-	if resp.StatusCode != 200 {
-		logger.Error("[ERROR] HTTP response failed: " + fmt.Sprint(resp.StatusCode))
-		return
+		return nil, err
 	}
 	defer resp.Body.Close()
 	buf, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP response failed: %d, %s", resp.StatusCode, string(buf))
+	}
+
+	return buf, nil
+}
+
+// Send API reqeust and check assigned you
+// @param repo string
+func watchPullRequests(repo string) {
+	logger.Passive("Watch pull requests: " + repo)
+
+	url := fmt.Sprintf("%s/repos/%s/pulls", GITHUB_APIBASE, repo)
+	buf, err := sendRequest(url, nil)
 	if err != nil {
 		logger.Error("[ERROR] " + err.Error())
 		return
@@ -269,8 +308,11 @@ func watchPullRequests(repo string) {
 		return
 	}
 
-	// Loop and check asssignee
+	// Loop and check asssignee and mensioned comment
 	for _, pr := range list {
+		checkIssueComment(repo, pr)
+		checkReviewComment(repo, pr)
+		checkReviewRequests(repo, pr)
 		if login, ok := pr.Assignee["login"]; !ok || login.(string) != config.Name {
 			continue
 		}
@@ -303,6 +345,98 @@ func watchPullRequests(repo string) {
 		val := make([]byte, 8)
 		binary.LittleEndian.PutUint64(val, uint64(time.Now().Unix()))
 		db.Put(key, val, nil)
+	}
+
+}
+
+// Check PR's review comments
+func checkReviewComment(repo string, pr PullRequest) {
+	logger.Passive("Check review comment: " + repo)
+	url := fmt.Sprintf("%s/repos/%s/pulls/%d/comments", GITHUB_APIBASE, repo, pr.Number)
+	buf, err := sendRequest(url, nil)
+	if err != nil {
+		logger.Error("[ERROR] " + err.Error())
+		return
+	}
+
+	var comments = make([]Comment, 0)
+	if err := json.Unmarshal(buf, &comments); err != nil {
+		logger.Error("[ERROR] " + err.Error())
+		return
+	}
+
+	for _, c := range comments {
+		if !strings.Contains(c.Body, "@"+config.Name) {
+			continue
+		}
+		key := []byte(fmt.Sprintf("review_%d_%d", pr.Number, c.Id))
+		if _, err := db.Get(key, nil); err != nil {
+			logger.Notify(fmt.Sprintf("Mensioned in PR: %s", c.Url))
+			go notifyComment(pr.Number, c.Url)
+			db.Put(key, []byte("1"), nil)
+		}
+	}
+}
+
+// Check PR's comments
+func checkIssueComment(repo string, pr PullRequest) {
+	logger.Passive("Check mensioned comment: " + repo)
+	url := fmt.Sprintf("%s/repos/%s/issues/%d/comments", GITHUB_APIBASE, repo, pr.Number)
+	buf, err := sendRequest(url, map[string]string{
+		"Accept": "application/vnd.github.black-cat-preview+json",
+	})
+	if err != nil {
+		logger.Error("[ERROR] " + err.Error())
+		return
+	}
+
+	var comments = make([]Comment, 0)
+	if err := json.Unmarshal(buf, &comments); err != nil {
+		logger.Error("[ERROR] " + err.Error())
+		return
+	}
+
+	for _, c := range comments {
+		if !strings.Contains(c.Body, "@"+config.Name) {
+			continue
+		}
+		key := []byte(fmt.Sprintf("comment_%d_%d", pr.Number, c.Id))
+		if _, err := db.Get(key, nil); err != nil {
+			logger.Notify(fmt.Sprintf("Mensioned in PR issue: %s", c.Url))
+			go notifyComment(pr.Number, c.Url)
+			db.Put(key, []byte("1"), nil)
+		}
+	}
+}
+
+// Check you added as reviewer
+func checkReviewRequests(repo string, pr PullRequest) {
+	logger.Passive("Check review request: " + repo)
+	url := fmt.Sprintf("%s/repos/%s/pulls/%d/requested_reviewers", GITHUB_APIBASE, repo, pr.Number)
+	buf, err := sendRequest(url, map[string]string{
+		"Accept": "application/vnd.github.black-cat-preview+json",
+	})
+	if err != nil {
+		logger.Error("[ERROR] " + err.Error())
+		return
+	}
+
+	var reviewers = make([]Reviewer, 0)
+	if err := json.Unmarshal(buf, &reviewers); err != nil {
+		logger.Error("[ERROR] " + err.Error())
+		return
+	}
+
+	for _, r := range reviewers {
+		if r.Name != config.Name {
+			continue
+		}
+		key := []byte(fmt.Sprintf("reviewer_%d_%d", pr.Number, r.Id))
+		if _, err := db.Get(key, nil); err != nil {
+			logger.Notify(fmt.Sprintf("You added as reviewer in PR: #%d", pr.Number))
+			go notifyReviewer(pr)
+			db.Put(key, []byte("1"), nil)
+		}
 	}
 }
 
@@ -339,4 +473,91 @@ func notify(pr PullRequest) error {
 	}
 
 	return exec.Command("terminal-notifier", args...).Run()
+}
+
+// Send notification for comment
+func notifyComment(prId int, url string) error {
+	if *isSilent {
+		return nil
+	}
+	args := []string{
+		"-title",
+		fmt.Sprintf("Mensioned in PR: #%d", prId),
+		"-timeout",
+		"300",
+		"-open",
+		url,
+		"-message",
+		url,
+		"-appIcon",
+		filepath.Join(baseDir, "icon.png"),
+	}
+
+	return exec.Command("terminal-notifier", args...).Run()
+}
+
+// Send reviewer notification
+func notifyReviewer(pr PullRequest) error {
+	if *isSilent {
+		return nil
+	}
+	args := []string{
+		"-title",
+		fmt.Sprintf("You added reviewer: #%d", pr.Number),
+		"-subtitle",
+		pr.Title,
+		"-timeout",
+		"300",
+		"-open",
+		pr.Url,
+		"-message",
+		pr.Url,
+		"-appIcon",
+		filepath.Join(baseDir, "icon.png"),
+	}
+
+	return exec.Command("terminal-notifier", args...).Run()
+}
+
+// Show summary
+func showSummary(from string) {
+	switch from {
+	case "today":
+		from = time.Now().Format("20060102")
+	case "yesterday":
+		from = time.Now().Add(-time.Hour * 24).Format("20060102")
+	}
+	var t time.Time
+	var err error
+	t, err = time.Parse("20060102", from)
+	if err != nil {
+		logger.Error("Unrecognized summary date. Please input as YYYYMMDD format or reserved string 'today' and 'yesterday'.")
+		return
+	}
+	t = t.Add(-time.Hour * 9)
+	query := url.Values{}
+	query.Add("since", t.Format("2006-01-02T15:00:00Z"))
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/notifications?%s", GITHUB_APIBASE, query.Encode()), nil)
+	if err != nil {
+		logger.Error("[ERROR] " + err.Error())
+		return
+	}
+	// Attach access token
+	req.Header.Add("Authorization", "token "+config.AccessToken)
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+	resp, err := client.Do(req)
+	defer resp.Body.Close()
+	buf, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		logger.Error("[ERROR] " + err.Error())
+		return
+	}
+	fmt.Println(string(buf))
+
 }
