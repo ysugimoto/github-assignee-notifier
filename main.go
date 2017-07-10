@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -24,11 +25,12 @@ import (
 
 // Application Configuration
 type Config struct {
-	Name         string   `toml:"name"`
-	AccessToken  string   `toml:"token"`
-	Repositories []string `toml:"repositories"`
-	PollingTime  int      `toml:"polling"`
-	Repeat       uint64   `toml:"repeat"`
+	Name           string   `toml:"name"`
+	AccessToken    string   `toml:"token"`
+	Repositories   []string `toml:"repositories"`
+	PollingTime    int      `toml:"polling"`
+	Repeat         uint64   `toml:"repeat"`
+	ApproveMessage string   `toml:"approve_message"`
 }
 
 // Pull Request data
@@ -36,8 +38,15 @@ type PullRequest struct {
 	Id       int                    `json:"id"`
 	Title    string                 `json:"title"`
 	Assignee map[string]interface{} `json:"assignee"`
+	User     map[string]interface{} `json:"user"`
 	Number   int                    `json:"number"`
 	Url      string                 `json:"html_url"`
+}
+
+// Pull Request files
+type PullRequestFile struct {
+	Filename string `json:"filename"`
+	Status   string `json:"status"`
 }
 
 // Comment data
@@ -73,7 +82,7 @@ func (l Logger) Passive(message string) {
 	fmt.Println(DARK, message, RESET)
 }
 func (l Logger) Error(message string) {
-	fmt.Println(DARK, message, RESET)
+	fmt.Println(RED, message, RESET)
 }
 func (l Logger) Warn(message string) {
 	fmt.Println(YELLOW, message, RESET)
@@ -97,9 +106,9 @@ var logger Logger
 var isNocolor *bool
 var isJson *bool
 var isSilent *bool
+var isAutomaticApprove *bool
 
 func init() {
-	var err error
 	baseDir = filepath.Join(os.Getenv("HOME"), CONFIG_DIR)
 	configPath := filepath.Join(baseDir, "config")
 	config = &Config{}
@@ -161,12 +170,6 @@ func init() {
 		)
 	}
 
-	// Open LevelDB
-	db, err = leveldb.OpenFile(filepath.Join(baseDir, "db"), nil)
-	if err != nil {
-		panic(err)
-	}
-
 	if !ok {
 		fmt.Println("Aborted.")
 		os.Exit(0)
@@ -221,17 +224,40 @@ func main() {
 	isNocolor = flag.Bool("nocolor", false, "No colored output")
 	isJson = flag.Bool("json", false, "Message returns JSON string")
 	isSilent = flag.Bool("silent", false, "Silent mode: stop notification, output only")
+	isAutomaticApprove = flag.Bool("automatic_approve", false, "Automatic approve if changes are bumping version only")
+	flag.Parse()
 
-	defer db.Close()
+	if *isAutomaticApprove {
+		logger.Warn("Automatic approve mode enabled")
+	}
 
-	if len(os.Args) > 1 && os.Args[1] == "summary" {
-		from := "yesterday"
-		if len(os.Args) > 2 {
-			from = os.Args[2]
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "summary":
+			from := "yesterday"
+			if len(os.Args) > 2 {
+				from = os.Args[2]
+			}
+			showSummary(from)
+			return
+		case "config":
+			editor := os.Getenv("EDITOR")
+			cmd := exec.Command(editor, filepath.Join(baseDir, "config"))
+			cmd.Stdout = os.Stdout
+			cmd.Stdin = os.Stdin
+			cmd.Run()
+			return
 		}
-		showSummary(from)
+	}
+
+	// Open LevelDB
+	var err error
+	db, err = leveldb.OpenFile(filepath.Join(baseDir, "db"), nil)
+	if err != nil {
+		logger.Error("Cannot open LevelDB. Have you already run other process?")
 		return
 	}
+	defer db.Close()
 
 	wait := make(chan struct{}, 0)
 
@@ -254,13 +280,14 @@ func main() {
 	<-wait
 }
 
-func sendRequest(url string, customHeaders map[string]string) ([]byte, error) {
-	req, err := http.NewRequest("GET", url, nil)
+func sendRequest(method, url string, customHeaders map[string]string, body io.Reader) ([]byte, error) {
+	req, err := http.NewRequest(method, url, body)
 	if err != nil {
 		return nil, err
 	}
 	// Attach access token
 	req.Header.Add("Authorization", "token "+config.AccessToken)
+	req.Header.Add("Content-Type", "application/json")
 	if customHeaders != nil {
 		for key, val := range customHeaders {
 			req.Header.Add(key, val)
@@ -296,7 +323,7 @@ func watchPullRequests(repo string) {
 	logger.Passive("Watch pull requests: " + repo)
 
 	url := fmt.Sprintf("%s/repos/%s/pulls", GITHUB_APIBASE, repo)
-	buf, err := sendRequest(url, nil)
+	buf, err := sendRequest("GET", url, nil, nil)
 	if err != nil {
 		logger.Error("[ERROR] " + err.Error())
 		return
@@ -315,6 +342,11 @@ func watchPullRequests(repo string) {
 		checkReviewRequests(repo, pr)
 		if login, ok := pr.Assignee["login"]; !ok || login.(string) != config.Name {
 			continue
+		}
+		if *isAutomaticApprove && pr.User["login"].(string) != config.Name {
+			if checkAndApprove(repo, pr) {
+				continue
+			}
 		}
 		key := []byte(fmt.Sprint(pr.Id))
 		if v, err := db.Get(key, nil); err != nil {
@@ -353,7 +385,7 @@ func watchPullRequests(repo string) {
 func checkReviewComment(repo string, pr PullRequest) {
 	logger.Passive("Check review comment: " + repo)
 	url := fmt.Sprintf("%s/repos/%s/pulls/%d/comments", GITHUB_APIBASE, repo, pr.Number)
-	buf, err := sendRequest(url, nil)
+	buf, err := sendRequest("GET", url, nil, nil)
 	if err != nil {
 		logger.Error("[ERROR] " + err.Error())
 		return
@@ -382,9 +414,9 @@ func checkReviewComment(repo string, pr PullRequest) {
 func checkIssueComment(repo string, pr PullRequest) {
 	logger.Passive("Check mensioned comment: " + repo)
 	url := fmt.Sprintf("%s/repos/%s/issues/%d/comments", GITHUB_APIBASE, repo, pr.Number)
-	buf, err := sendRequest(url, map[string]string{
+	buf, err := sendRequest("GET", url, map[string]string{
 		"Accept": "application/vnd.github.black-cat-preview+json",
-	})
+	}, nil)
 	if err != nil {
 		logger.Error("[ERROR] " + err.Error())
 		return
@@ -413,9 +445,9 @@ func checkIssueComment(repo string, pr PullRequest) {
 func checkReviewRequests(repo string, pr PullRequest) {
 	logger.Passive("Check review request: " + repo)
 	url := fmt.Sprintf("%s/repos/%s/pulls/%d/requested_reviewers", GITHUB_APIBASE, repo, pr.Number)
-	buf, err := sendRequest(url, map[string]string{
+	buf, err := sendRequest("GET", url, map[string]string{
 		"Accept": "application/vnd.github.black-cat-preview+json",
-	})
+	}, nil)
 	if err != nil {
 		logger.Error("[ERROR] " + err.Error())
 		return
@@ -519,6 +551,29 @@ func notifyReviewer(pr PullRequest) error {
 	return exec.Command("terminal-notifier", args...).Run()
 }
 
+// Send automatic approved PR
+func notifyAutomaticApprove(pr PullRequest) error {
+	if *isSilent {
+		return nil
+	}
+	args := []string{
+		"-title",
+		fmt.Sprintf("PR has approved automatically: #%d", pr.Number),
+		"-subtitle",
+		pr.Title,
+		"-timeout",
+		"300",
+		"-open",
+		pr.Url,
+		"-message",
+		pr.Url,
+		"-appIcon",
+		filepath.Join(baseDir, "icon.png"),
+	}
+
+	return exec.Command("terminal-notifier", args...).Run()
+}
+
 // Show summary
 func showSummary(from string) {
 	switch from {
@@ -559,5 +614,75 @@ func showSummary(from string) {
 		return
 	}
 	fmt.Println(string(buf))
+}
 
+// Check pull request files and approve if bunmping version only
+func checkAndApprove(repo string, pr PullRequest) bool {
+	buf, err := sendRequest("GET", fmt.Sprintf("%s/repos/%s/pulls/%d/files", GITHUB_APIBASE, repo, pr.Number), nil, nil)
+	if err != nil {
+		logger.Error("[ERROR] " + err.Error())
+		return false
+	}
+
+	prFiles := make([]PullRequestFile, 0)
+	if err := json.Unmarshal(buf, &prFiles); err != nil {
+		logger.Error("[ERROR] " + err.Error())
+		return false
+	}
+
+	if len(prFiles) != 1 || prFiles[0].Filename != "package.json" {
+		logger.Passive("PR doesn't bump version only. Skipped")
+		return false
+	}
+
+	// Approve automatically
+	if err := sendApproveRequest(repo, pr); err != nil {
+		logger.Error("[ERROR] " + err.Error())
+		return false
+	}
+
+	// Update assignee
+	if err := updatePullRequestAssignee(repo, pr); err != nil {
+		logger.Error("[ERROR] " + err.Error())
+		return false
+	}
+
+	logger.Notify(fmt.Sprintf("Automatic PR approved #%d", pr.Number))
+	go notifyAutomaticApprove(pr)
+	return true
+}
+
+func sendApproveRequest(repo string, pr PullRequest) error {
+	msgBody := "This PR approved automatically!"
+	if config.ApproveMessage != "" {
+		msgBody = config.ApproveMessage
+	}
+	postBody := map[string]string{
+		"body":  msgBody,
+		"event": "APPROVE",
+	}
+	b, _ := json.Marshal(postBody)
+	_, err := sendRequest(
+		"POST",
+		fmt.Sprintf("%s/repos/%s/pulls/%d/reviews", GITHUB_APIBASE, repo, pr.Number),
+		map[string]string{"Accept": "application/vnd.github.black-cat-preview+json"},
+		bytes.NewReader(b),
+	)
+
+	return err
+}
+
+func updatePullRequestAssignee(repo string, pr PullRequest) error {
+	userName, _ := pr.User["login"].(string)
+	patchBody := map[string]interface{}{
+		"assignees": []string{userName},
+	}
+	b, _ := json.Marshal(patchBody)
+	_, err := sendRequest(
+		"PATCH",
+		fmt.Sprintf("%s/repos/%s/issues/%d", GITHUB_APIBASE, repo, pr.Number),
+		nil,
+		bytes.NewReader(b),
+	)
+	return err
 }
