@@ -57,6 +57,10 @@ type Comment struct {
 }
 
 // Reviewer data
+type ReviewRequest struct {
+	Users []Reviewer `json:"users"`
+}
+
 type Reviewer struct {
 	Id   int    `json:"id"`
 	Name string `json:"login"`
@@ -266,7 +270,7 @@ func main() {
 		watchPullRequests(r)
 		go func(duration int, repo string) {
 			time.Sleep(time.Duration(duration*10) * time.Second)
-			ticker := time.NewTicker(time.Second * 60)
+			ticker := time.NewTicker(time.Second * time.Duration(config.PollingTime))
 			for {
 				select {
 				case <-ticker.C:
@@ -452,14 +456,15 @@ func checkReviewRequests(repo string, pr PullRequest) {
 		logger.Error("[ERROR] " + err.Error())
 		return
 	}
-
-	var reviewers = make([]Reviewer, 0)
-	if err := json.Unmarshal(buf, &reviewers); err != nil {
+	reviews := ReviewRequest{
+		Users: []Reviewer{},
+	}
+	if err := json.Unmarshal(buf, &reviews); err != nil {
 		logger.Error("[ERROR] " + err.Error())
 		return
 	}
 
-	for _, r := range reviewers {
+	for _, r := range reviews.Users {
 		if r.Name != config.Name {
 			continue
 		}
@@ -616,6 +621,22 @@ func showSummary(from string) {
 	fmt.Println(string(buf))
 }
 
+func checkAutoApproveFiles(prFiles []PullRequestFile) (ok bool) {
+	switch len(prFiles) {
+	case 1:
+		if prFiles[0].Filename == "package.json" {
+			ok = true
+		}
+	case 2:
+		if prFiles[0].Filename == "package.json" || prFiles[0].Filename == "package-lock.json" {
+			if prFiles[1].Filename == "package.json" || prFiles[1].Filename == "package-lock.json" {
+				ok = true
+			}
+		}
+	}
+	return
+}
+
 // Check pull request files and approve if bunmping version only
 func checkAndApprove(repo string, pr PullRequest) bool {
 	buf, err := sendRequest("GET", fmt.Sprintf("%s/repos/%s/pulls/%d/files", GITHUB_APIBASE, repo, pr.Number), nil, nil)
@@ -630,7 +651,7 @@ func checkAndApprove(repo string, pr PullRequest) bool {
 		return false
 	}
 
-	if len(prFiles) != 1 || prFiles[0].Filename != "package.json" {
+	if !checkAutoApproveFiles(prFiles) {
 		logger.Passive("PR doesn't bump version only. Skipped")
 		return false
 	}
